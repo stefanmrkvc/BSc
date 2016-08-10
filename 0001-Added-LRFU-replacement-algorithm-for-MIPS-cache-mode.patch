@@ -1,0 +1,254 @@
+From cc2e24c5fa9a5bc5257bb9a57563a9a8fb3c46d1 Mon Sep 17 00:00:00 2001
+From: Stefan Markovic <stefan.markovic@rt-rk.com>
+Date: Mon, 16 May 2016 17:11:03 +0200
+Subject: [PATCH] Added LRFU replacement algorithm for MIPS cache model
+ simulation
+
+---
+ target-mips/cache_defs.h |  3 +++
+ target-mips/op_helper.c  | 56 ++++++++++++++++++++++++++++++++++++++++++++++--
+ vl.c                     | 12 +++++++++++
+ 3 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/target-mips/cache_defs.h b/target-mips/cache_defs.h
+index cb08db0..3ca96dd 100644
+--- a/target-mips/cache_defs.h
++++ b/target-mips/cache_defs.h
+@@ -32,6 +32,8 @@
+ #define MIPS_CACHE_TYPE_ORUN_2X2 (1<<19)
+ #define MIPS_CACHE_TYPE_ORUN_2X4 (1<<20)
+ #define MIPS_CACHE_TYPE_ASID_IN_KSEG (1<<21)
++//New replacement algorithm
++#define MIPS_CACHE_TYPE_LRFU   (1<<22)
+ 
+ // Cacheable segment bits
+ #define MIPS_CACHE_MEM_KUSEG    (0x0f<<24)
+@@ -96,6 +98,7 @@ struct mips_cache_t {
+     target_ulong    *ptags;              // tag array  - tag[way][set]
+     uint32_t        *flags;              //
+     uint64_t        *times;              // LRU/NMRU timestamp
++    uint64_t        *access_count_lrfu;  // LRFU access counters
+ 
+     // Stats
+     uint64_t        reads;
+diff --git a/target-mips/op_helper.c b/target-mips/op_helper.c
+index 3e31752..ab18801 100644
+--- a/target-mips/op_helper.c
++++ b/target-mips/op_helper.c
+@@ -68,7 +68,12 @@ mips_cache_t *mips_cache_init(uint32_t ways, uint32_t sets, uint32_t linelength,
+         c->times = (uint64_t*) calloc(ways * sets * sizeof(uint64_t),1);
+         if (!c->times) return(NULL);
+ 
++        // Allocate memory for LRFU access counters
++        c->access_count_lrfu = (uint64_t*) calloc(ways * sets * sizeof(uint64_t),1);
++        if(!c->access_count_lrfu) return(NULL);
++
+         // All flags, tags and times will be zero
++
+     }
+ 
+     // Set up basic parameters
+@@ -94,6 +99,7 @@ mips_cache_t *mips_cache_init(uint32_t ways, uint32_t sets, uint32_t linelength,
+ void mips_cache_free(mips_cache_t *c)
+ {
+     if (c) {
++        if (c->access_count_lrfu) free(c->access_count_lrfu);
+         if (c->times) free(c->times);
+         if (c->flags) free(c->flags);
+         if (c->ptags) free(c->ptags);
+@@ -126,6 +132,7 @@ void mips_cache_report_logfile(FILE *file, mips_cache_t *c)
+     if (c->type & MIPS_CACHE_TYPE_LRU)      fprintf(file,"            LRU      - Least recently used replacement, per set\n");
+     if (c->type & MIPS_CACHE_TYPE_NMRU4)    fprintf(file,"            NMRU4    - Not the most recently used 4, per set\n");
+     if (c->type & MIPS_CACHE_TYPE_NMRU8)    fprintf(file,"            NMRU8    - Not the most recently used 8, per set\n");
++    if (c->type & MIPS_CACHE_TYPE_LRFU)     fprintf(file,"            LRFU     - Last frequently used with LRU if conflicted counters, per set\n");
+     if (c->type & MIPS_CACHE_TYPE_RDAL)     fprintf(file,"            RDAL     - Allocate on read miss\n");
+     if (c->type & MIPS_CACHE_TYPE_WRAL)     fprintf(file,"            WRAL     - Allocate on write miss\n");
+     if (c->type & MIPS_CACHE_TYPE_WTHRU)    fprintf(file,"            WTHRU    - Write through - passed to next level\n");
+@@ -161,7 +168,6 @@ void mips_cache_config(CPUMIPSState *env)
+     uint32_t        sets;
+     uint32_t        linelength;
+     uint32_t        type;
+     env->imodel = NULL;
+     env->dmodel = NULL;
+     env->l2model = NULL;
+@@ -212,6 +218,9 @@ void mips_cache_config(CPUMIPSState *env)
+             case 5:
+                 type |= MIPS_CACHE_TYPE_NMRU8;
+                 break;
++            case 6:
++                type |= MIPS_CACHE_TYPE_LRFU;
++                break;
+             default :
+                 fprintf(stderr, "Illegal victim selection algorithm!\n");
+                 exit(EXIT_FAILURE);
+@@ -265,6 +274,9 @@ void mips_cache_config(CPUMIPSState *env)
+             case 5:
+                 type |= MIPS_CACHE_TYPE_NMRU8;
+                 break;
++            case 6:
++                type |= MIPS_CACHE_TYPE_LRFU;
++                break;
+             default :
+                 fprintf(stderr, "Illegal victim selection algorithm!\n");
+                 exit(EXIT_FAILURE);
+@@ -317,6 +329,9 @@ void mips_cache_config(CPUMIPSState *env)
+             case 5:
+                 type |= MIPS_CACHE_TYPE_NMRU8;
+                 break;
++            case 6:
++                type |= MIPS_CACHE_TYPE_LRFU;
++                break;
+             default :
+                 fprintf(stderr, "Illegal victim selection algorithm!\n");
+                 exit(EXIT_FAILURE);
+@@ -378,6 +393,9 @@ void mips_cache_config(CPUMIPSState *env)
+             case 5:
+                 type |= MIPS_CACHE_TYPE_NMRU8;
+                 break;
++            case 6:
++                type |= MIPS_CACHE_TYPE_LRFU;
++                break;
+             default :
+                 fprintf(stderr, "Illegal victim selection algorithm!\n");
+                 exit(EXIT_FAILURE);
+@@ -1361,9 +1379,9 @@ void mips_cache_access( CPUMIPSState *env,
+                 way_hit = way;
+                 miss = 0;
+                 break;
+-                }
+             }
+         }
++    }
+ 
+     if (way_hit == -1) {
+             // Miss
+@@ -1463,6 +1481,34 @@ void mips_cache_access( CPUMIPSState *env,
+                     }
+                 }
+ 
++                else if (c->type & MIPS_CACHE_TYPE_LRFU) {
++                    minval=c->access_count_lrfu[set_idx_w+0];
++                    victim_way=0;
++                    for (way=0; way<c->ways; way++) {
++                        if (!(c->flags[set_idx_w+way] & MIPS_CACHE_FLAG_VALID)) {
++                            victim_way = way;
++                            break;
++                        }
++                    }
++                    if (c->flags[set_idx_w+victim_way] & MIPS_CACHE_FLAG_VALID) {
++                        for (way=1; way<c->ways; way++) {
++                            if (c->access_count_lrfu[set_idx_w+way] < minval) {
++                                victim_way = way;
++                                minval = c->access_count_lrfu[set_idx_w+way];
++                            }
++                        }
++                       
++                        for (way=0; way<c->ways; way++) {
++                            if ((c->access_count_lrfu[set_idx_w+way] == minval) && (way != victim_way)) {
++                                if (c->times[set_idx_w+way] < c->times[set_idx_w+victim_way]) {
++                                    victim_way = way;
++                                }
++                            }
++                        }
++                        c->access_count_lrfu[set_idx_w+victim_way] = 0;
++                    }
++                }
++
+                 // Stats for valid replacement victims
+                 if (c->flags[set_idx_w+victim_way] & MIPS_CACHE_FLAG_VALID) {
+                     if (c->flags[set_idx_w+victim_way] & MIPS_CACHE_FLAG_DIRTY) {
+@@ -1563,6 +1609,7 @@ void mips_cache_access( CPUMIPSState *env,
+ 
+                 // Access next level of heirarchy for line load
+                 //
++
+                 if (c->next_level != NULL)
+                     mips_cache_access(env, c->next_level, asid, va, pa,
+                                       cmd, c->linelength,1, access_type);
+@@ -1639,6 +1686,11 @@ void mips_cache_access( CPUMIPSState *env,
+         // Set LRU time - reads and writes
+         if (c->type & (MIPS_CACHE_TYPE_LRU | MIPS_CACHE_TYPE_NMRU4 | MIPS_CACHE_TYPE_NMRU8))
+             c->times[set_idx_w+way_hit] = *(c->timeptr);
++    
++        if (c->type & MIPS_CACHE_TYPE_LRFU) {
++            c->times[set_idx_w+way_hit] = *(c->timeptr);
++            c->access_count_lrfu[set_idx_w+way_hit]++;
++        }
+     }
+ 
+     // Update LRU/Random time counter
+diff --git a/vl.c b/vl.c
+index 0d7af06..d09cb87 100644
+--- a/vl.c
++++ b/vl.c
+@@ -3220,6 +3220,8 @@ static void parse_cache_params(const char *arguments)
+                         l1imodel.alg = 4;
+                     } else if (strcasecmp((value + 1), "nmru8") == 0) {
+                         l1imodel.alg = 5;
++                    } else if (strcasecmp((value + 1), "lrfu") == 0) {
++                        l1imodel.alg = 6;
+                     } else if (strcasecmp((value + 1), "?") == 0) {
+                         fprintf(stderr, "Cache victim selection algorithm :\n\n");
+                         fprintf(stderr, "lru\n");
+@@ -3227,6 +3229,7 @@ static void parse_cache_params(const char *arguments)
+                         fprintf(stderr, "random\n");
+                         fprintf(stderr, "nmru4\n");
+                         fprintf(stderr, "nmru8\n");
++                        fprintf(stderr, "lrfu\n");
+                         exit(EXIT_FAILURE);
+                     } else {
+                         fprintf(stderr, "Illegal l1ialg argument! Type -cache l1ialg=? for "
+@@ -3331,6 +3334,8 @@ static void parse_cache_params(const char *arguments)
+                         l1dmodel.alg = 4;
+                     } else if (strcasecmp((value + 1), "nmru8") == 0) {
+                         l1dmodel.alg = 5;
++                    } else if (strcasecmp((value + 1), "lrfu") == 0) {
++                        l1dmodel.alg = 6;
+                     } else if (strcasecmp((value + 1), "?") == 0) {
+                         fprintf(stderr, "Cache victim selection algorithm :\n\n");
+                         fprintf(stderr, "lru\n");
+@@ -3338,6 +3343,7 @@ static void parse_cache_params(const char *arguments)
+                         fprintf(stderr, "random\n");
+                         fprintf(stderr, "nmru4\n");
+                         fprintf(stderr, "nmru8\n");
++                        fprintf(stderr, "lrfu\n");
+                         exit(EXIT_FAILURE);
+                     } else {
+                         fprintf(stderr, "Illegal l1dalg argument! Type -cache l1dalg=? for "
+@@ -3443,6 +3449,8 @@ static void parse_cache_params(const char *arguments)
+                         l2model.alg = 4;
+                     } else if (strcasecmp((value + 1), "nmru8") == 0) {
+                         l2model.alg = 5;
++                    } else if (strcasecmp((value + 1), "lrfu") == 0) {
++                        l2model.alg = 6;
+                     } else if (strcasecmp((value + 1), "?") == 0) {
+                         fprintf(stderr, "Cache victim selection algorithm :\n\n");
+                         fprintf(stderr, "lru\n");
+@@ -3450,6 +3458,7 @@ static void parse_cache_params(const char *arguments)
+                         fprintf(stderr, "random\n");
+                         fprintf(stderr, "nmru4\n");
+                         fprintf(stderr, "nmru8\n");
++                        fprintf(stderr, "lrfu\n");
+                         exit(EXIT_FAILURE);
+                     } else {
+                         fprintf(stderr, "Illegal l2alg argument! Type -cache l2alg=? for "
+@@ -3555,6 +3564,8 @@ static void parse_cache_params(const char *arguments)
+                         l3model.alg = 4;
+                     } else if (strcasecmp((value + 1), "nmru8") == 0) {
+                         l3model.alg = 5;
++                    } else if (strcasecmp((value + 1), "lrfu") == 0) {
++                        l3model.alg = 6;
+                     } else if (strcasecmp((value + 1), "?") == 0) {
+                         fprintf(stderr, "Cache victim selection algorithm :\n\n");
+                         fprintf(stderr, "lru\n");
+@@ -3562,6 +3573,7 @@ static void parse_cache_params(const char *arguments)
+                         fprintf(stderr, "random\n");
+                         fprintf(stderr, "nmru4\n");
+                         fprintf(stderr, "nmru8\n");
++                        fprintf(stderr, "lrfu\n");
+                         exit(EXIT_FAILURE);
+                     } else {
+                         fprintf(stderr, "Illegal l3alg argument! Type -cache l3alg=? for "
+-- 
+1.9.1
+
